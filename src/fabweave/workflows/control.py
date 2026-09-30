@@ -24,6 +24,7 @@ from fabweave.rework.authorization import ReworkPolicy, authorization_decision
 from fabweave.shipment.commit import Allocation, CommitLedger
 from fabweave.spc.control import western_electric_rules
 from fabweave.takt.monitor import TaktResult, takt_result
+from fabweave.transfer.chain import TransferChain
 from fabweave.yielding.rollup import StepYield, route_yield
 
 
@@ -260,3 +261,62 @@ def performance_summary(
     expected_steps: list[str],
 ) -> PerformanceSummary:
     return PerformanceSummary(takt_result(completions, window_start, window_end), route_yield(steps, expected_steps))
+
+
+def record_transfer_scan(
+    chain: TransferChain,
+    transfer_id: str,
+    stage: str,
+    scan_id: str,
+    at: int,
+    material_ids: list[str] | tuple[str, ...] | None = None,
+    units: int | None = None,
+    holds: dict[str, HoldState] | None = None,
+    expected_hold_versions: dict[str, int] | None = None,
+) -> Decision:
+    """Advance a cross-plant transfer by one scan, fail-closed.
+
+    Ordering, duplicate replays, manifest and unit conservation are decided by
+    :class:`~fabweave.transfer.chain.TransferChain`.  In addition, the
+    ``departed`` (factory-exit) gate consults every loaded material's hold and
+    refuses exit while an active hold exists.  A repeated departure scan
+    replays the recorded exit without re-evaluating or re-booking it.
+    """
+    decision = chain.scan_decision(transfer_id, stage, scan_id, at, material_ids, units)
+    if not decision.allowed:
+        return decision
+    if decision.evidence.get("duplicate"):
+        return decision
+    if stage == "departed":
+        # The chain already verified the resubmitted scan matches the load
+        # manifest; the gate itself evaluates the recorded manifest.
+        manifest = chain.material_manifest(transfer_id)
+        versions = expected_hold_versions or {}
+        checked: dict[str, object] = {}
+        held: list[str] = []
+        blockers: list[str] = []
+        for material_id in manifest:
+            state = (holds or {}).get(material_id)
+            if state is None:
+                continue
+            release = release_decision(state, versions.get(material_id, state.version), at)
+            if not release.allowed:
+                held.append(material_id)
+                blockers.extend(f"{material_id}:{reason}" for reason in release.reasons)
+            checked[material_id] = state.version
+        if held:
+            return deny(
+                *(f"departure_hold_active:{material_id}" for material_id in held),
+                *blockers,
+                stage=stage,
+                held_materials=tuple(held),
+                hold_versions=checked,
+            )
+    record = chain.scan(transfer_id, stage, scan_id, at, material_ids, units)
+    return allow(
+        stage=stage,
+        event_id=record.event_id,
+        event_sequence=record.sequence,
+        scanned_at=record.occurred_at,
+        duplicate=False,
+    )
